@@ -2,7 +2,8 @@
 .vscode/
 1.bat
 2.bat
-
+.obj/
+.libs/
 # 编译输出
 *.o
 *.obj
