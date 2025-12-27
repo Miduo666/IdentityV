@@ -1,0 +1,14 @@
+# VS Code 配置文件
+.vscode/
+1.bat
+2.bat
+
+# 编译输出
+*.o
+*.obj
+*.so
+*.a
+
+# 系统文件
+.DS_Store
+Thumbs.db
