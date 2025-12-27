@@ -339,7 +339,7 @@ namespace Touch {
             }
 
             int string_len = rand() % 10 + 5;
-            char string[string_len];
+            char string[16];  // 固定大小，最大 rand()%10+5 = 14，16 足够
             memset(&ui_dev, 0, sizeof(ui_dev));
 
             genRandomString(string, string_len);
