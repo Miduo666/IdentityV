@@ -101,12 +101,12 @@ float 矩阵视野距离;
 bool M_Android_LoadFont(float SizePixels) {
     ImGuiIO &io = ImGui::GetIO();
     
-    //ImFontConfig config;
-    //config.FontDataOwnedByAtlas = false;
-    //config.SizePixels = SizePixels;
-    //config.OversampleH = 1;
-    //::zh_font = io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, 0.0f, &config, io.Fonts->GetGlyphRangesChineseFull());    
-    //io.Fonts->AddFontDefault(&config);
+    // 使用内嵌字体（兼容Android 15/16）
+    ImFontConfig config;
+    config.FontDataOwnedByAtlas = false;
+    config.SizePixels = SizePixels;
+    config.OversampleH = 1;
+    ::zh_font = io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, SizePixels, &config, io.Fonts->GetGlyphRangesChineseFull());    
 
 	static const ImWchar icons_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
     ImFontConfig icons_config;
@@ -123,8 +123,8 @@ bool M_Android_LoadFont(float SizePixels) {
     return zh_font != nullptr;
 }
 void init_My_drawdata() {
-    ImGui::My_Android_LoadSystemFont(25.0f); //(加载系统字体 无法释放)
-    M_Android_LoadFont(25.0f); //加载字体(还有图标)
+    // ImGui::My_Android_LoadSystemFont(25.0f); // 已禁用：Android 15/16 无法访问系统字体
+    M_Android_LoadFont(25.0f); //加载内嵌字体(还有图标)
 }
 
 
