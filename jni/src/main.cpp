@@ -80,7 +80,8 @@ int main(int argc, char *argv[]) {
     
     DrawFPS.SetFps(fps);
     DrawFPS.AotuFPS_init();
-    DrawFPS.setAffinity();
+    DrawFPS.setAffinityLittleCore();  // 优化：只使用小核，避免大核占用
+    DrawFPS.setLowPriority(5);        // 降低优先级，减少资源抢占
     
     ::init_My_drawdata();  // 初始化绘制数据
     

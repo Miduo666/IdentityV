@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <thread>
+#include <climits>
 
 struct timer {
 	bool fpsio;
@@ -166,7 +167,59 @@ struct timer {
 		return sNumCpus;
 	}
 	
+	// 读取CPU最大频率，用于区分大小核
+	long getCpuMaxFreq(int cpu) {
+		char path[128];
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+		FILE* file = fopen(path, "r");
+		if (!file) return -1;
+		long freq = 0;
+		fscanf(file, "%ld", &freq);
+		fclose(file);
+		return freq;
+	}
+	
+	// 获取小核列表（频率最低的核心组）
+	// 返回小核数量，核心ID存入littleCores数组
+	int getLittleCores(int* littleCores, int maxCores) {
+		const int32_t numCpus = getNumCpus();
+		long freqs[16] = {0};
+		long minFreq = LONG_MAX;
+		long maxFreq = 0;
+		
+		// 先获取所有核心的最大频率
+		for (int i = 0; i < numCpus && i < 16; i++) {
+			freqs[i] = getCpuMaxFreq(i);
+			if (freqs[i] > 0) {
+				if (freqs[i] < minFreq) minFreq = freqs[i];
+				if (freqs[i] > maxFreq) maxFreq = freqs[i];
+			}
+		}
+		
+		// 计算小核阈值（小核频率通常明显低于大核）
+		// 使用 (minFreq + maxFreq) / 2 作为阈值，低于此值的为小核
+		long threshold = (minFreq + maxFreq) / 2;
+		
+		int count = 0;
+		for (int i = 0; i < numCpus && i < 16 && count < maxCores; i++) {
+			if (freqs[i] > 0 && freqs[i] <= threshold) {
+				littleCores[count++] = i;
+			}
+		}
+		
+		// 如果检测失败，默认使用前4个核心（通常是小核）
+		if (count == 0) {
+			int defaultLittle = (numCpus > 4) ? 4 : numCpus;
+			for (int i = 0; i < defaultLittle && count < maxCores; i++) {
+				littleCores[count++] = i;
+			}
+		}
+		
+		return count;
+	}
+	
 	//设置CPU亲和，平稳循环时间 , 需要在循环同线程调用。
+	// 旧版本：使用所有核心
 	void setAffinity()
 	{
 		const int32_t numCpus = getNumCpus();
@@ -176,6 +229,40 @@ struct timer {
 			CPU_SET(cpu, &cpuSet);
 		}
 		sched_setaffinity(gettid(), sizeof(cpuSet), &cpuSet);
+	}
+	
+	// 优化版本：只使用小核（低功耗核心），避免大核占用
+	// 适合辅助类程序，减少发热和资源占用
+	void setAffinityLittleCore()
+	{
+		int littleCores[8];
+		int count = getLittleCores(littleCores, 8);
+		
+		cpu_set_t cpuSet;
+		CPU_ZERO(&cpuSet);
+		for (int i = 0; i < count; i++) {
+			CPU_SET(littleCores[i], &cpuSet);
+		}
+		sched_setaffinity(gettid(), sizeof(cpuSet), &cpuSet);
+	}
+	
+	// 指定核心版本：手动指定使用哪些核心
+	// cores: 核心ID数组, count: 核心数量
+	void setAffinityManual(int* cores, int count)
+	{
+		cpu_set_t cpuSet;
+		CPU_ZERO(&cpuSet);
+		for (int i = 0; i < count; i++) {
+			CPU_SET(cores[i], &cpuSet);
+		}
+		sched_setaffinity(gettid(), sizeof(cpuSet), &cpuSet);
+	}
+	
+	// 设置线程优先级（降低优先级减少资源抢占）
+	// nice值范围 -20(最高) 到 19(最低), 默认0
+	void setLowPriority(int niceValue = 10)
+	{
+		nice(niceValue);
 	}
 	
 	//高精度sleep,单位纳秒

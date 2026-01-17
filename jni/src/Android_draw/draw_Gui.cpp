@@ -2,6 +2,10 @@
 #include <thread>
 #include <cstdint>
 #include <stdio.h>
+#include <sched.h>
+#include <climits>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include "My_font/zh_Font.h"
 #include "My_font/fontawesome-brands.h"
 #include "My_font/fontawesome-regular.h"
@@ -122,9 +126,25 @@ bool M_Android_LoadFont(float SizePixels) {
     io.Fonts->AddFontDefault();
     return zh_font != nullptr;
 }
+
+// 获取 Android 系统版本
+static int get_android_version() {
+    char version_str[128] = {0};
+    __system_property_get("ro.build.version.release", version_str);
+    if (version_str[0] == '\0') return 0;
+    return atoi(version_str);
+}
+
 void init_My_drawdata() {
-    // ImGui::My_Android_LoadSystemFont(25.0f); // 已禁用：Android 15/16 无法访问系统字体
-    M_Android_LoadFont(25.0f); //加载内嵌字体(还有图标)
+    int android_version = get_android_version();
+    if (android_version >= 15) {
+        // Android 15 及以上：使用内嵌字体（系统字体访问受限）
+        M_Android_LoadFont(24.0f);
+    } else {
+        // Android 14 及以下：使用系统字体
+        ImGui::My_Android_LoadSystemFont(25.0f);
+        M_Android_LoadFont(25.0f);
+    }
 }
 
 
@@ -374,55 +394,147 @@ int get_name_pid1(const char *packageName) {
     return -1;
 }
 
+// ============== 线程CPU亲和性设置（小核优化） ==============
+static long getCpuMaxFreqForThread(int cpu) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+    FILE* file = fopen(path, "r");
+    if (!file) return -1;
+    long freq = 0;
+    fscanf(file, "%ld", &freq);
+    fclose(file);
+    return freq;
+}
+
+static void setThreadToLittleCore() {
+    cpu_set_t cpuSet;
+    CPU_ZERO(&cpuSet);
+    
+    // 获取CPU核心数
+    int numCpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (numCpus <= 0) numCpus = 8;
+    if (numCpus > 16) numCpus = 16;
+    
+    long freqs[16] = {0};
+    long minFreq = LONG_MAX;
+    long maxFreq = 0;
+    
+    // 获取所有核心的最大频率
+    for (int i = 0; i < numCpus; i++) {
+        freqs[i] = getCpuMaxFreqForThread(i);
+        if (freqs[i] > 0) {
+            if (freqs[i] < minFreq) minFreq = freqs[i];
+            if (freqs[i] > maxFreq) maxFreq = freqs[i];
+        }
+    }
+    
+    // 计算小核阈值
+    long threshold = (minFreq + maxFreq) / 2;
+    int count = 0;
+    
+    for (int i = 0; i < numCpus; i++) {
+        if (freqs[i] > 0 && freqs[i] <= threshold) {
+            CPU_SET(i, &cpuSet);
+            count++;
+        }
+    }
+    
+    // 如果检测失败，默认使用前4个核心
+    if (count == 0) {
+        int defaultLittle = (numCpus > 4) ? 4 : numCpus;
+        for (int i = 0; i < defaultLittle; i++) {
+            CPU_SET(i, &cpuSet);
+        }
+    }
+    
+    pid_t tid = syscall(__NR_gettid);  // Android 兼容的获取线程ID方式
+    sched_setaffinity(tid, sizeof(cpuSet), &cpuSet);
+    nice(5);  // 降低线程优先级
+}
+
 int c;
 char libso[256] = {"libclient.so"};
 void read_thread(long int PD1, long int PD2, long int PD3) {
-    pid = get_name_pid1("dwrg");
-    get_name_pid(extractedString);
-
+    // 将读取线程也绑定到小核，减少大核占用
+    setThreadToLittleCore();
+    
     ModuleBssInfo result;
-    if (strstr(extractedString, "com.netease.idv") != NULL) {
-        libbase = get_module_base(pid, ".");
-        result = get_module_bss(pid, ".");
-    } else {
-        libbase = get_module_base(pid,libso);
-        result = get_module_bss(pid, libso);
+    
+    // 循环获取进程ID和模块地址，直到都有效为止
+    while (true) {
+        // 尝试获取进程ID
+        pid = get_name_pid1("dwrg");
+        if (pid == -1) {
+            状态 = 0;
+            sleep(2);  // 每2秒重试一次
+            continue;
+        }
+        
+        // 成功获取进程ID后，获取包名和模块地址
+        get_name_pid(extractedString);
+        
+        if (strstr(extractedString, "com.netease.idv") != NULL) {
+            libbase = get_module_base(pid, ".");
+            result = get_module_bss(pid, ".");
+        } else {
+            libbase = get_module_base(pid, libso);
+            result = get_module_bss(pid, libso);
+        }
+        
+        // 检查模块地址是否有效
+        if (libbase != 0 && result.addr != 0) {
+            break;  // 成功获取进程ID和模块地址
+        }
+        
+        // 模块地址无效，可能游戏刚启动，模块还未加载完成
+        状态 = 0;
+        sleep(2);  // 等待后重试
     }
 
     c = (result.taddr - result.addr) / 4096;
     long buff[512];  // 缓存指针数据
 
-    // 第一次检查 MatrixOffset 和 ArrayaddrOffset
+    // 搜索 MatrixOffset 和 ArrayaddrOffset
     while (MatrixOffset == 0 || ArrayaddrOffset == 0) {
         状态 = 1;
-        for (int i = 0; i < c; i++) {
+        bool found_both = false;
+        
+        for (int i = 0; i < c && !found_both; i++) {
             vm_readv(result.addr + (i * 4096), &buff, 0x1000);
             for (int ii = 0; ii < 512; ii++) {
-                if (buff[ii] != 0) {
+                // 仅在 MatrixOffset 未找到时搜索
+                if (MatrixOffset == 0 && buff[ii] != 0) {
                     int tempMatrix = getDword(getPtr64(buff[ii] + Offsets::MATRIX_PTR_1) + Offsets::MATRIX_FEATURE_OFFSET);
                     if (tempMatrix == Offsets::MATRIX_FEATURE_1 || tempMatrix == Offsets::MATRIX_FEATURE_2) {
                         MatrixOffset = result.addr - libbase + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE;
                     }
                 }
 
-                if (buff[ii] == Offsets::ARRAY_FEATURE_1) {
+                // 仅在 ArrayaddrOffset 未找到时搜索
+                if (ArrayaddrOffset == 0 && buff[ii] == Offsets::ARRAY_FEATURE_1) {
                     int tempszz = getDword(result.addr + 4096 * i + Offsets::ARRAY_ELEMENT_SIZE * ii - Offsets::ARRAY_PREV_CHECK);
                     if (tempszz == Offsets::ARRAY_FEATURE_2 && getPtr64(result.addr + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_CHECK_OFFSET) == (result.addr + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_SELF_REF)) {
                         ArrayaddrOffset = result.addr - libbase + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_ADDR_OFFSET;
                     }
                 }
+                
+                // 两个都找到了，提前退出
+                if (MatrixOffset != 0 && ArrayaddrOffset != 0) {
+                    found_both = true;
+                    break;
+                }
             }
         }
 
-        if (MatrixOffset != 0 && ArrayaddrOffset != 0) {
-            状态 = 2;
+        if (found_both) {
             break;
         }
         遍历次数++;
         sleep(5);
     }
-         while (true)
-    {               
+    状态 = 2;
+    while (true)
+    {    
         Arrayaddr = getPtr64(libbase + ArrayaddrOffset);    //数组
         long int 测试 = getPtr64(libbase + ArrayaddrOffset+8);
         Count = 2000;    //数组数量
@@ -953,7 +1065,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
         // 渲染模式与 FPS 信息
         ImGui::Text("渲染模式 : %s, gui版本 : %s", graphics->RenderName, IMGUI_VERSION);
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "应用平均 %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", ImGui::GetIO().Framerate);
         
         // 内存占用
         size_t mem_kb = get_memory_usage_kb();
@@ -976,7 +1088,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("游戏进程:%d", pid);
             ImGui::Text("模块入口:%lx", libbase);
             ImGui::Text("游戏包名:%s", extractedString);
-            //游戏包名的作用是什么？
             //数据没有清除功能
             ImGui::Text("矩阵地址:%lx", Matrix);
             ImGui::Text("数组地址:%lx", Arrayaddr);
