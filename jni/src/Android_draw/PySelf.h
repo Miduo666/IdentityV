@@ -1,0 +1,711 @@
+#ifndef IDV_PY_SELF_H
+#define IDV_PY_SELF_H
+
+// ============================================================================
+// 自身锚点 + 废弃模型黑名单 —— 走游戏内嵌 CPython 的对象图读取
+// ============================================================================
+//
+// 解决两件一直靠启发式凑的事：
+//
+// 一、"当前操控的是谁"
+//   旧做法是 draw_Gui.cpp 里那套 `相机深度(10~40) + zy + 阵营是1或2`。
+//   它的问题：任何一个求生者走进 10~40 这条深度带就会被误判成自身，而 +0xaa(zy)
+//   按实测是通用状态位、**不区分是否自身**。自身锚错 -> Z 锚错 -> 全场距离全错，
+//   而且那个对象会被 continue 掉不再绘制。
+//
+//   ★ 引擎自己持有答案：GK.g_cam_ctrl.unit 就是"当前视角/操控的单位"。
+//     2026-09-22 受控实验，两角色两阵营各切换一次共 4 次读数，4/4 全部指对：
+//       求生者机械师  本体 ⇄ 机械玩偶(MyCivilianPuppetUnit, 在 units_by_type[2])
+//       监管梦之女巫  本体 ⇄ 梦之信徒(MyYidhraPuppetUnit,   在 units_by_type[236])
+//
+//   ！！`GK.g_unit` 不能用 ！！它是"我的主角色"，切到从属时纹丝不动(4/4 从不跟随)。
+//   拿它做自身高亮，机械师操控玩偶 / 女巫操控信徒时会高亮错人。这是个陷阱，
+//   曾经的记录"g_unit = 本机玩家"在能切换操控对象的角色上就是错的。
+//   同理 `g_cam_ctrl.free_mode_unit` 恒为主角色，也不是我们要的。
+//
+//   另外这两个字段**不要碰**：
+//     is_operating     机械师挂在本体上，语义跟名字相反("本体正在遥控玩偶中")，
+//                      而且每个角色名字都不一样(女巫叫 yidhra_operating)，没通用性
+//     bj_operating     所有单位(含 AI)恒为 True，完全没用
+//
+// 二、"废弃模型"
+//   形态切换类角色(红蝶等)换形态**不是换操控对象**(cam.unit 不变)，是同一个 unit
+//   换模型。旧形态的场景对象留在数组里、仍然被绘制循环捕获，这就是"废弃模型"。
+//
+//   ★ 判据：unit.another_model + 0x20 就是废弃形态的场景对象指针。
+//     实测红蝶一局 model+0x20 = 0x7ACBDFFF80(在画的那个)、
+//     another_model+0x20 = 0x7ACDDD0600，后者与独立抓到的废弃对象地址逐位相同。
+//   这替掉了 ShouldSkipEntity 里那份红蝶/木偶师类名黑名单：精确、跟视角无关、不用维护名单。
+//
+//   ⚠️ 不要拿 `+0x73`/`+0x70`(= NeoX 模型对象的 visible) 当过滤器。
+//   它是渲染剔除的结果：废弃模型恒不可见，但**远处的真实对象同样不可见**
+//   (实测手持飞刀这种真道具 +0x70 也是 0)。用它过滤会重演"求生者只看得到身边的密码机"。
+//
+//   ⚠️ 只覆盖 another_model 这一类。实测另外还有 balloon_model(女巫气球)、
+//   _fragrance_image(木偶师忘忧之香残影) 等同样指向非活跃模型的属性，它们目前靠
+//   ShouldSkipEntity 的鬼魂判定挡住。要做全的话，应当取 unit.model 的 ob_type
+//   拿到 world.model 类型指针，再扫整个实例 dict 把该类型的值全部拉黑(只留 model 那份)，
+//   并把扫出来的序号按对局缓存住，否则每轮扫上千个条目开销太大。
+//
+// 链路、CPython 3.11 布局、三条铁律跟 PyProgress.h 完全同源，那边文件头有详细说明。
+// 这里按同样风格自带一份 dict 工具，免得去改那两个已经验证过的文件。
+// ============================================================================
+
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+#include <ctime>
+#include <thread>
+#include <atomic>
+#include <unistd.h>
+#include "PyRoot.h"
+#include "PyCore.h"
+
+// 命名空间跟文件同名(PySelf)；draw_Gui.cpp 里另有全局变量 `uintptr_t self_obj`，别起成 self_obj 之类重名
+namespace PySelf {
+
+// sys.modules 与 dict/int/True 由 PyRoot.h 运行时找出，这里不再写死模块偏移
+
+static const int MAX_STALE = 32;
+static const int MAX_BODIES = 32;
+
+// 要扫的单位类型：1=监管(巡视者也在这里) 2=求生者(机械玩偶、幻灯师分身也在这里) 236=梦之信徒
+// 1065=伊斯人幻影(yith_ghost03，2026-09-22 实测；漏了它时幻影被本体集合挡掉)。
+// 局中召出来的从属单位常有独立的键，某个召唤物被误挡时先用 _scripts\cmd_phase.py 查它在哪个键下
+static const int UNIT_TYPES[] = {1, 2, 236, 1065};
+static const int UNIT_TYPE_COUNT = sizeof(UNIT_TYPES) / sizeof(UNIT_TYPES[0]);
+
+// ---- 本体集合：哪些场景对象是"角色本体"(2026-09-22 实测) ----
+// 场景数组里跟角色同名、或者挂在角色身上的对象很多：_fragrance_image(每个求生者一份、同名、恒不可见)、
+// another_model(另一形态)、balloon_model/umbrella_model(挂件)、item_lst[i].model(手持道具)、
+// 时装挂件、约瑟夫相机……类名和 +0x240/+0x6D 都分不开(另一形态、气球跟本体一样是 2 / 0x50)。
+// 唯一干净的定义：单位类型表里各键下每个单位的 unit.model + 0x20。
+//   - 魔术师分身是 CloneUnit，在独立的键 [17] 里，不在这张表里，自然排除
+//   - 幻灯师分身 SlideManCloneUnit 却在 [2] 里，靠 is_civilian_puppet == True 排除
+//     (它 is_clone=False、is_puppet=False，这两个名字都骗人，别用)
+//   - 机械玩偶 MyCivilianPuppetUnit 在 [2] 里、is_civilian_puppet=False，**保留**(用户要画它)
+//   - owner_uid 别用：机械玩偶实测为 None，可能只在被操控时才有值
+// ---- 模仿者模式(身份局，2026-09-24 两局实测，见 skill ruochen-teardown.md ⑦) ----
+// 玩家是 units_by_type[1088] 的 CopycatPlayerUnit(12 人)，**不在键 1/2**。
+//   identity_id    隐藏身份，进局约 2 秒后赋值、整局不变；全场真身份都下发给客户端
+//   copycat_index  0~11，游戏里的号码 = 它 + 1
+// 死亡后原单位留在 1088(模型不可见)，另生成 [1089] GhostCopycatPlayerUnit(同 unique_id，identity=None)。
+// 所以"谁死了" = 1088 里 unique_id 出现在 1089 里的那些；死者不收进本体集合，绘制侧自然不画。
+static const int COPYCAT_PLAYER_TYPE = 1088;
+static const int COPYCAT_GHOST_TYPE = 1089;
+static const int MAX_COPYCAT = 16;
+// identity 0 = 还没赋值/读不到；seat 从 1 开始，0 = 读不到；body 0 = 读不到
+struct CopycatEntry { uint64_t body; int identity; int seat; bool dead; };
+
+struct Snapshot {
+    uint64_t anchor;                  // 当前操控单位的场景对象，0 = 没读到
+    int      camp;                  // 1=监管 2=求生者 其它=从属单位的 unit_type
+    int64_t  uid;
+    uint64_t stale[MAX_STALE];
+    int      stale_count;
+    uint64_t body[MAX_BODIES];      // 本体集合，见上
+    int      body_count;
+    uint64_t hunter_body;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
+    CopycatEntry copycat[MAX_COPYCAT]; // 模仿者模式的活人，见上
+    int      copycat_count;
+};
+
+// 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
+static Snapshot g_buf[2];
+static std::atomic<int> g_active{0};      // 见 PyProgress.h 同名变量的注释(volatile 不保证发布顺序)
+
+static uintptr_t g_libbase = 0;
+static uint64_t  g_module_dict = 0;
+static int64_t   g_i_cam = -1, g_i_cam_unit = -1;
+static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1;
+static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
+// another_model 的序号缓存**按类分开存**(键 = 实例的 ob_type)。
+// 各玩家类(ButcherUnit / CivilianUnit / MyCivilianUnit / 各种 Puppet ...)实例字典大小不同，
+// another_model 的序号也不同；共用一个缓存时，遍历每换一个类就失效一次、从头按名字扫到它
+// (字典上千条，每条 2 次读取)，一轮要扫 2~4 次，占了这个线程九成的读取量。
+// 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：resolve_index() 每次都按名字核对，
+// 核对不上就重扫，所以最坏情况就是退回共用缓存那种多扫几遍，不会读错属性。
+// 表满了(类比这个多)就退回共用的 g_i_*。model / is_civilian_puppet 同理，一起按类存。
+struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; bool is_puppet; };
+static const int MAX_CLASSES = 8;
+static ClassIndexCache g_class_cache[MAX_CLASSES];
+static int     g_class_cache_count = 0;
+static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
+// 模仿者模式只有两个类(CopycatPlayerUnit / GhostCopycatPlayerUnit)，各用一组序号缓存就够
+static int64_t g_cc_i_model = -1, g_cc_i_another = -1, g_cc_i_ident = -1, g_cc_i_index = -1, g_cc_i_uq = -1;
+static int64_t g_ccg_i_uq = -1;
+static int64_t g_cc_i_pos = -1;
+
+// ---- 模仿者模式的坐标：按 unit.position 画，绕开场景对象(学若辰，2026-09-26) ----
+// 假面舞会时每个人的模型换成石像(场景数组 12 -> 24 个人物对象)，身份簿按 model+0x20 配对就配不上了。
+// 若辰根本不按模型配对：身份读 unit 上的 identity_id，位置读 unit.position(再依次试 visual_position/…)，
+// 自己用矩阵投影，所以换不换模型都无所谓。我们照做，只读 position 这一个。
+// position 对象布局在密码机上验过(+0x10/+0x14/+0x18 = X/高度/Y，顺序同场景坐标 +0xa0/+0xa4/+0xa8)，
+// 玩家身上没单独验过，所以加一道校准：第一次读到的值必须跟该人场景对象的坐标对上，才记下这个对象类型，
+// 之后只认这个类型。一直校准不上 = 布局不对，绘制侧自动退回按场景对象画(旧行为)。
+// 这个坐标每轮单独发布，不依赖锚点(开会时锚点常读不到)；单次读失败沿用上次的值 POS_HOLD_MS。
+struct CopycatPos { bool ok; float x, z, y; };            // x / 高度 / y
+static CopycatPos g_pos[2][MAX_COPYCAT];                   // 下标 = 号码 - 1
+static std::atomic<int> g_pos_active{0};
+static CopycatPos g_pos_work[MAX_COPYCAT];
+static int64_t    g_pos_ms[MAX_COPYCAT];                   // 最后一次读成功的时刻，0 = 从没读到
+static std::atomic<uint64_t> g_pos_type{0};                // position 对象的类型，校准通过后才非 0
+static const int64_t POS_HOLD_MS = 300;
+// 校准时 position 与场景坐标的容差(场景单位，约 11.9 单位 = 1 米)。守墓人那次实测两者逐位相同
+static const float POS_CALIB_TOL = 2.0f;
+
+static int64_t now_ms()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static volatile bool g_available = false;
+// 局外(大厅/准备阶段)：units_by_type 完整读出来了、而且没有键 1/2。
+// 准备阶段 cam.unit 是 MyCityUnit，它的 model+0x20 读不出场景指针(2026-09-22 实测)，锚点那步会失败，
+// 所以这个标志不挂在 快照/g_available 上，在锚点之前单独算、单独发布。读不全一律算"不是局外"
+static volatile bool g_in_lobby = false;
+static volatile int  g_fail_streak = 0;
+static char g_status[128] = "未启动";
+
+// ---- 公共 CPython 工具：实现在 PyCore.h，三个模块共用一份(见那里的文件头) ----
+using PyCore::is_obj; using PyCore::str_equals; using PyCore::Dict; using PyCore::read_dict;
+using PyCore::key_slot; using PyCore::value_slot; using PyCore::find_key; using PyCore::get_attr;
+using PyCore::resolve_index; using PyCore::get_type_list; using PyCore::get_inst_dict;
+using PyCore::read_int; using PyCore::read_list; using PyCore::get_scene_obj;
+
+static bool resolve_module()
+{
+    const char *why = "";
+    g_module_dict = PyCore::game_kernel_dict(why);
+    if (!g_module_dict) { snprintf(g_status, sizeof(g_status), "%s", why); return false; }
+    return true;
+}
+
+// 判断是不是局外。units_by_type 的每个键都要读成功才下结论 —— get_type_list() 返回 0 分不清
+// "没有这个键"和"键对象所在页读不到"，拿它判会在对局中途的读失败里误判成局外、把人全藏掉。
+// 局外 = 没有键 1(监管) 也没有键 2(求生者)。2026-09-22 准备阶段实测键只有 53/59/74/100/1009。
+// 模仿者模式的玩家在键 1088，不算的话这个模式会被判成局外、人物整类不画
+static bool check_lobby(uint64_t ubt, bool &in_lobby)
+{
+    Dict k;
+    if (!read_dict(ubt, k) || k.n_entries <= 0) return false;
+    bool has_player = false;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (kp == 0) continue;                         // 已删除的条目
+        if (!is_obj(kp) || getPtr64(kp + 8) != PyRoot::g_int_type) return false;
+        int64_t sz = 0; uint32_t dg = 0;
+        if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4)) return false;
+        if (sz == 1 && (dg == 1 || dg == 2 || dg == COPYCAT_PLAYER_TYPE)) has_player = true;
+    }
+    in_lobby = !has_player;
+    return true;
+}
+
+// 类名(PyTypeObject.tp_name，+0x18 是 char*)里含不含 Puppet。
+// 实测 [1] 里的巡视者是 MyButcherPatrolPuppetUnit，挑"监管本体"时要跳过它
+static bool class_name_has_puppet(uint64_t type)
+{
+    uint64_t np = getPtr64(type + 0x18);
+    if (!is_obj(np)) return false;
+    char buf[48] = {0};                                // 最长的 MyButcherPatrolPuppetUnit 也才 25 字节
+    if (!vm_readv(np, buf, sizeof(buf) - 1)) return false;
+    return strstr(buf, "Puppet") != nullptr;
+}
+
+static inline void add_unique(uint64_t *tbl, int &cnt, int cap, uint64_t sp)
+{
+    for (int j = 0; j < cnt; j++) if (tbl[j] == sp) return;
+    if (cnt < cap) tbl[cnt++] = sp;
+}
+
+// 扫一类单位：
+//   another_model -> 废弃模型黑名单
+//   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
+//   [1] 里第一个类名不含 Puppet 的 -> 监管本体(预知监管用)
+static void collect_units(uint64_t ubt, int type, Snapshot &res)
+{
+    uint64_t lst = get_type_list(ubt, type);
+    int64_t n = 0; uint64_t items = 0;
+    if (!read_list(lst, n, items) || n == 0) return;
+
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t inst = getPtr64(items + i * 8);
+        uint64_t d = get_inst_dict(inst);
+        if (!d) continue;
+        Dict dk;
+        if (!read_dict(d, dk)) continue;
+
+        // 按实例的类取序号缓存(见 g_class_cache)。类型指针读不到、或表满了就用共用缓存
+        // 别叫 type：会遮住参数 type(单位类型键)，导致下面 type == 1 永远不成立、hunter_body 永远拿不到
+        uint64_t cls = getPtr64(inst + 8);
+        ClassIndexCache *slot = nullptr;
+        if (is_obj(cls)) {
+            for (int j = 0; j < g_class_cache_count; j++)
+                if (g_class_cache[j].type == cls) { slot = &g_class_cache[j]; break; }
+            if (!slot && g_class_cache_count < MAX_CLASSES) {
+                slot = &g_class_cache[g_class_cache_count++];
+                slot->type = cls;
+                slot->i_another = slot->i_model = slot->i_cpuppet = -1;
+                slot->is_puppet = class_name_has_puppet(cls);    // 类名一个类只读一次
+            }
+        }
+        int64_t &i_another = slot ? slot->i_another : g_i_another;
+        int64_t &i_model = slot ? slot->i_model : g_i_unit_model;
+        int64_t &i_cpuppet = slot ? slot->i_cpuppet : g_i_cpuppet;
+
+        // 实测所有玩家类都有 another_model(没有第二形态时值是 None)，查不到就跳过(不是错误)
+        i_another = resolve_index(d, dk, i_another, "another_model");
+        if (i_another >= 0) {
+            uint64_t sp = get_scene_obj(getPtr64(value_slot(dk, i_another)));
+            if (sp) add_unique(res.stale, res.stale_count, MAX_STALE, sp);
+        }
+
+        i_model = resolve_index(d, dk, i_model, "model");
+        if (i_model < 0) continue;
+        uint64_t body = get_scene_obj(getPtr64(value_slot(dk, i_model)));
+        if (!body) continue;
+
+        // 幻灯师分身：is_civilian_puppet 是 True 单例。属性不存在(监管类)或读不到都按"不是分身"
+        i_cpuppet = resolve_index(d, dk, i_cpuppet, "is_civilian_puppet");
+        if (i_cpuppet >= 0 && getPtr64(value_slot(dk, i_cpuppet)) == PyRoot::g_true) continue;
+
+        add_unique(res.body, res.body_count, MAX_BODIES, body);
+        if (type == 1 && res.hunter_body == 0 && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
+            res.hunter_body = body;
+    }
+}
+
+// 读 unit.position 到 out(x/高度/y)。position 每帧被赋成新对象，照 read_number 的做法：
+// 读指针 -> 读对象 -> 再读一次指针确认没变，refcount > 0，最多三次。类型校准见 g_pos_type 那段注释
+static bool read_position(uint64_t d, const Dict &dk, uint64_t body, float out[3])
+{
+    g_cc_i_pos = resolve_index(d, dk, g_cc_i_pos, "position");
+    if (g_cc_i_pos < 0) return false;
+    uint64_t slot = value_slot(dk, g_cc_i_pos);
+    for (int t = 0; t < 3; t++) {
+        uint64_t vp = getPtr64(slot);
+        if (!is_obj(vp)) continue;
+        uint8_t b[0x1c];
+        if (!vm_readv(vp, b, sizeof(b))) continue;
+        if (getPtr64(slot) != vp) continue;
+        int64_t rc = 0; memcpy(&rc, b, 8);
+        uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
+        if (rc <= 0 || !is_obj(tp)) continue;
+        float v[3]; memcpy(v, b + 0x10, 12);
+        bool sane = true;
+        for (int k = 0; k < 3; k++) if (!std::isfinite(v[k]) || fabsf(v[k]) > 1e5f) sane = false;
+        if (!sane || (v[0] == 0 && v[2] == 0)) continue;
+
+        uint64_t known = g_pos_type.load();
+        if (known == 0) {
+            // 还没校准：跟这个人的场景对象坐标对一下，对上才认这个类型
+            if (!body) return false;
+            uint64_t coor = getPtr64(body + 0x28);
+            float s[3];
+            if (!is_obj(coor) || !vm_readv(coor + 0xa0, s, 12)) return false;
+            for (int k = 0; k < 3; k++) if (!(fabsf(s[k] - v[k]) <= POS_CALIB_TOL)) return false;
+            g_pos_type = tp;
+            printf("[模仿者] position 校准通过 类型=0x%llx (%.1f,%.1f,%.1f)\n", (unsigned long long)tp, v[0], v[1], v[2]);
+            fflush(stdout);
+        } else if (tp != known) {
+            continue;
+        }
+        memcpy(out, v, 12);
+        return true;
+    }
+    return false;
+}
+
+// 每轮都发布一次坐标(包括不在模仿者局时，全部 ok=false)。单次读失败沿用上次的值 POS_HOLD_MS
+static void pos_publish(int64_t now)
+{
+    int w = 1 - g_pos_active;
+    for (int i = 0; i < MAX_COPYCAT; i++) {
+        g_pos[w][i] = g_pos_work[i];
+        g_pos[w][i].ok = g_pos_ms[i] != 0 && now - g_pos_ms[i] <= POS_HOLD_MS;
+    }
+    g_pos_active = w;
+}
+
+// 模仿者模式：1088 里每个活人的 model+0x20 进本体集合，同时记下身份、号码和 unit.position；1089(鬼魂)只用来认死者
+static void collect_copycat(uint64_t ubt, Snapshot &res)
+{
+    int64_t n = 0; uint64_t items = 0;
+    if (!read_list(get_type_list(ubt, COPYCAT_PLAYER_TYPE), n, items) || n == 0) return;
+    const int64_t now = now_ms();
+
+    // 死者的 unique_id(字符串，账号 uid 这类纯数字)。读不到就当没人死，最坏是多画一具尸体
+    char dead[MAX_COPYCAT][24];
+    int dead_n = 0;
+    int64_t gn = 0; uint64_t gitems = 0;
+    if (read_list(get_type_list(ubt, COPYCAT_GHOST_TYPE), gn, gitems)) {
+        for (int64_t i = 0; i < gn && dead_n < MAX_COPYCAT; i++) {
+            uint64_t d = get_inst_dict(getPtr64(gitems + i * 8));
+            Dict dk;
+            if (!d || !read_dict(d, dk)) continue;
+            g_ccg_i_uq = resolve_index(d, dk, g_ccg_i_uq, "unique_id");
+            if (g_ccg_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_ccg_i_uq)), dead[dead_n], sizeof(dead[0])))
+                dead_n++;
+        }
+    }
+
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t d = get_inst_dict(getPtr64(items + i * 8));
+        Dict dk;
+        if (!d || !read_dict(d, dk)) continue;
+
+        g_cc_i_another = resolve_index(d, dk, g_cc_i_another, "another_model");
+        if (g_cc_i_another >= 0) {
+            uint64_t sp = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_another)));
+            if (sp) add_unique(res.stale, res.stale_count, MAX_STALE, sp);
+        }
+
+        // 每一项都可能单独读失败(内存压力下页被换出)，读不到的留 0，交给身份簿沿用旧值
+        uint64_t body = 0;
+        g_cc_i_model = resolve_index(d, dk, g_cc_i_model, "model");
+        if (g_cc_i_model >= 0) body = get_scene_obj(getPtr64(value_slot(dk, g_cc_i_model)));
+
+        bool is_dead = false;
+        if (dead_n > 0) {
+            g_cc_i_uq = resolve_index(d, dk, g_cc_i_uq, "unique_id");
+            char uq[24];
+            if (g_cc_i_uq >= 0 && PyCore::read_str(getPtr64(value_slot(dk, g_cc_i_uq)), uq, sizeof(uq)))
+                for (int j = 0; j < dead_n && !is_dead; j++) is_dead = strcmp(uq, dead[j]) == 0;
+        }
+
+        if (body && !is_dead) add_unique(res.body, res.body_count, MAX_BODIES, body);
+        if (res.copycat_count >= MAX_COPYCAT) continue;
+
+        CopycatEntry &e = res.copycat[res.copycat_count++];
+        e.body = body;
+        e.identity = 0;
+        e.seat = 0;
+        e.dead = is_dead;
+        int64_t v = 0;
+        g_cc_i_ident = resolve_index(d, dk, g_cc_i_ident, "identity_id");
+        if (g_cc_i_ident >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_ident)), v) && v > 100 && v < 400)
+            e.identity = (int)v;
+        g_cc_i_index = resolve_index(d, dk, g_cc_i_index, "copycat_index");
+        if (g_cc_i_index >= 0 && read_int(getPtr64(value_slot(dk, g_cc_i_index)), v) && v >= 0 && v < MAX_COPYCAT)
+            e.seat = (int)v + 1;
+
+        // 坐标只给活人读；号码读不到就不知道记到哪一格
+        float p[3];
+        if (e.seat > 0 && !is_dead && read_position(d, dk, body, p)) {
+            CopycatPos &w = g_pos_work[e.seat - 1];
+            w.x = p[0]; w.z = p[1]; w.y = p[2];
+            g_pos_ms[e.seat - 1] = now;
+        }
+    }
+}
+
+// ---- 身份簿(锁存)：模仿者开会阶段游戏负载低，Python 堆页会被换进 zram，身份/模型全读不到 ----
+// 思路同 PyGenius.h 的天赋锁存，但简单得多：身份整局不变，按号码(copycat_index)记，
+//   - 读到就写进簿子(新读到的值永远覆盖旧值 —— 所以万一没清干净，新一局第一次读到就自动纠正)
+//   - 读不到就沿用簿子
+//   - 死亡只会置上、不会撤销
+//   - unit_mgr 地址变了(换局/回大厅)就整本清空
+// 只在界面上「模仿者模式」打开时记(g_book_enabled)，关掉就清空。
+// 发布方式跟 Snapshot 一样双缓冲，但**不依赖锚点成功** —— 锚点那步失败时簿子照样更新和发布
+struct CopycatSeat { bool known; uint64_t body; int identity; bool dead; };
+struct CopycatBook { CopycatSeat seat[MAX_COPYCAT]; int self_seat; };   // seat[号码-1]；self_seat 从 1 开始，0 = 不知道
+static CopycatBook g_book[2];
+static std::atomic<int> g_book_active{0};
+static CopycatBook g_book_work;                 // 只有 PySelf 线程碰
+static uint64_t g_book_um = 0;
+static std::atomic<bool> g_book_enabled{false};
+
+static void book_publish()
+{
+    int w = 1 - g_book_active;
+    g_book[w] = g_book_work;
+    g_book_active = w;
+}
+
+static bool book_empty(const CopycatBook &b)
+{
+    for (int i = 0; i < MAX_COPYCAT; i++) if (b.seat[i].known) return false;
+    return true;
+}
+
+static void book_merge(const Snapshot &res, uint64_t um)
+{
+    if (!g_book_enabled) {
+        if (!book_empty(g_book_work)) { memset(&g_book_work, 0, sizeof(g_book_work)); book_publish(); }
+        g_book_um = 0;
+        return;
+    }
+    bool changed = false;
+    if (is_obj(um) && um != g_book_um) {         // um 读不到(0)时什么都不动
+        if (!book_empty(g_book_work)) changed = true;
+        memset(&g_book_work, 0, sizeof(g_book_work));
+        g_book_um = um;
+    }
+    for (int i = 0; i < res.copycat_count; i++) {
+        const CopycatEntry &e = res.copycat[i];
+        if (e.seat < 1 || e.seat > MAX_COPYCAT) continue;       // 号码读不到就不知道记到哪一格
+        CopycatSeat &b = g_book_work.seat[e.seat - 1];
+        if (!b.known) { b.known = true; changed = true; }
+        if (e.body && e.body != b.body) { b.body = e.body; changed = true; }
+        if (e.identity && e.identity != b.identity) { b.identity = e.identity; changed = true; }
+        if (e.dead && !b.dead) { b.dead = true; changed = true; }
+    }
+    if (changed) book_publish();
+}
+
+static void book_mark_self(uint64_t anchor)
+{
+    if (!g_book_enabled || anchor == 0) return;
+    for (int i = 0; i < MAX_COPYCAT; i++) {
+        if (g_book_work.seat[i].known && g_book_work.seat[i].body == anchor) {
+            if (g_book_work.self_seat != i + 1) { g_book_work.self_seat = i + 1; book_publish(); }
+            return;
+        }
+    }
+}
+
+static bool try_refresh()
+{
+    if (g_module_dict == 0 && !resolve_module()) { g_in_lobby = false; return false; }
+
+    Snapshot res;
+    memset(&res, 0, sizeof(res));
+
+    // ---- 零、units_by_type + 局外判定(必须在锚点之前，见 g_in_lobby) ----
+    g_i_unit_mgr = find_key(g_module_dict, "unit_mgr", g_i_unit_mgr);
+    uint64_t um = (g_i_unit_mgr >= 0) ? get_attr(g_module_dict, g_i_unit_mgr) : 0;
+    uint64_t ud = get_inst_dict(um);
+    uint64_t ubt = 0;
+    if (ud) {
+        g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
+        ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
+    }
+    bool in_lobby = false;
+    g_in_lobby = is_obj(ubt) && check_lobby(ubt, in_lobby) && in_lobby;
+
+    // 模仿者模式放在锚点之前：锚点失败时身份簿和坐标照样要更新(开会阶段锚点常读不到)
+    static uint64_t pos_um = 0;
+    if (is_obj(um) && um != pos_um) {                   // 换局：上一局的坐标作废
+        memset(g_pos_ms, 0, sizeof(g_pos_ms));
+        pos_um = um;
+    }
+    if (is_obj(ubt)) collect_copycat(ubt, res);
+    pos_publish(now_ms());
+    book_merge(res, um);
+
+    // ---- 一、当前操控单位：g_cam_ctrl.unit ----
+    g_i_cam = find_key(g_module_dict, "g_cam_ctrl", g_i_cam);
+    uint64_t cam = (g_i_cam >= 0) ? get_attr(g_module_dict, g_i_cam) : 0;
+    if (!is_obj(cam)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 无效(未在对局中?)"); return false; }
+
+    uint64_t camd = get_inst_dict(cam);
+    if (!camd) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 不是 managed-dict 布局"); return false; }
+    Dict camk;
+    if (!read_dict(camd, camk)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 字典异常"); return false; }
+
+    g_i_cam_unit = resolve_index(camd, camk, g_i_cam_unit, "unit");
+    if (g_i_cam_unit < 0) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 里没有 unit"); return false; }
+    uint64_t me = getPtr64(value_slot(camk, g_i_cam_unit));
+    if (!is_obj(me)) { snprintf(g_status, sizeof(g_status), "cam.unit 为空"); return false; }
+
+    uint64_t me_d = get_inst_dict(me);
+    if (!me_d) { snprintf(g_status, sizeof(g_status), "cam.unit 没有实例字典"); return false; }
+    Dict me_k;
+    if (!read_dict(me_d, me_k)) { snprintf(g_status, sizeof(g_status), "cam.unit 字典异常"); return false; }
+
+    g_i_model = resolve_index(me_d, me_k, g_i_model, "model");
+    g_i_utype = resolve_index(me_d, me_k, g_i_utype, "unit_type");
+    g_i_uid   = resolve_index(me_d, me_k, g_i_uid,   "uid");
+
+    if (g_i_model >= 0) res.anchor = get_scene_obj(getPtr64(value_slot(me_k, g_i_model)));
+    if (g_i_utype >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_utype)), v)) res.camp = (int)v; }
+    if (g_i_uid   >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_uid)),   v)) res.uid  = v; }
+
+    if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "cam.unit.model 读不到"); return false; }
+
+    // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
+    if (is_obj(ubt))
+        for (int i = 0; i < UNIT_TYPE_COUNT; i++) collect_units(ubt, UNIT_TYPES[i], res);
+    book_mark_self(res.anchor);
+    // 这一段读不到不算失败：锚点已经拿到了。本体数为 0 时绘制侧会退回按类名画
+
+    int write_idx = 1 - g_active;
+    g_buf[write_idx] = res;
+    g_active = write_idx;                                   // 填完再翻转
+    int pos_ok = 0;
+    for (int i = 0; i < MAX_COPYCAT; i++) if (g_pos[g_pos_active][i].ok) pos_ok++;
+    snprintf(g_status, sizeof(g_status), "正常 %s uid=%lld 本体%d 废弃%d 身份%d 坐标%d%s",
+             res.camp == 1 ? "监管" : (res.camp == 2 ? "求生" : (res.camp == COPYCAT_PLAYER_TYPE ? "模仿者局" : "从属")),
+             (long long)res.uid, res.body_count, res.stale_count, res.copycat_count,
+             pos_ok, (res.copycat_count > 0 && g_pos_type.load() == 0) ? "(未校准)" : "");
+    return true;
+}
+
+static void refresh_once()
+{
+    if (g_libbase == 0) return;
+    if (!PyRoot::ensure()) {
+        g_available = false;
+        snprintf(g_status, sizeof(g_status), "%s", PyRoot::status_text());
+        return;
+    }
+    if (try_refresh()) { g_available = true; g_fail_streak = 0; return; }
+    g_available = false;
+    if (++g_fail_streak >= 8) {                       // 连续失败就把序号缓存作废，下一轮按名字重找
+        g_module_dict = 0;
+        g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
+        g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
+        g_i_unit_model = g_i_cpuppet = -1;
+        g_cc_i_model = g_cc_i_another = g_cc_i_ident = g_cc_i_index = g_cc_i_uq = g_ccg_i_uq = g_cc_i_pos = -1;
+        g_class_cache_count = 0;
+        g_fail_streak = 0;
+    }
+}
+
+// 自身锚点每帧都要用，而且切换操控对象时要立刻跟上，所以比天赋刷得勤(约一帧 60fps)
+static const int REFRESH_INTERVAL_MS = 16;
+
+static void thread_main()
+{
+    while (true) {
+        refresh_once();
+        usleep(REFRESH_INTERVAL_MS * 1000);
+    }
+}
+
+static void start(uintptr_t libbase)
+{
+    if (g_libbase != 0) return;
+    g_libbase   = libbase;
+    snprintf(g_status, sizeof(g_status), "启动中");
+    std::thread(thread_main).detach();
+    printf("[自身] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
+    fflush(stdout);
+}
+
+// ---------------- 给绘制侧用的只读接口 ----------------
+
+static inline bool available() { return g_available; }
+static inline const char *status_text() { return g_status; }
+
+// 当前操控单位的场景对象。返回 false 时绘制侧要退回相机深度启发式
+static bool anchor(uint64_t &obj)
+{
+    if (!g_available) return false;
+    uint64_t v = g_buf[g_active].anchor;
+    if (v == 0) return false;
+    obj = v;
+    return true;
+}
+
+// 当前视角的阵营：1=监管 2=求生者。0=没读到。
+// 注意操控从属单位时这里是从属的 unit_type(机械玩偶仍是 2、梦之信徒是 236)
+static inline int camp() { return g_available ? g_buf[g_active].camp : 0; }
+static inline int64_t self_uid() { return g_available ? g_buf[g_active].uid : 0; }
+
+// 形态切换留下的废弃模型 —— 替掉红蝶/木偶师类名黑名单
+static bool is_stale_model(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.stale_count; i++) if (s.stale[i] == (uint64_t)obj) return true;
+    return false;
+}
+
+// 大厅/准备阶段：Python 侧还没有任何玩家单位，场景里的 chr/player、chr/boss 对象(时装挂件、头饰、袖子)
+// 全都没有宿主，绘制侧据此整类不画。读不全时是 false，照旧按类名画
+static inline bool in_lobby() { return g_in_lobby; }
+
+// 本体集合能不能用。准备阶段/大厅里 units_by_type 没有 [1]/[2](实测两次)，这里就是 false，
+// 绘制侧据此退回按类名画(读取失败时同样是 false，所以"是否局外"要看 in_lobby()，别用它)
+static inline bool body_set_ready() { return g_available && g_buf[g_active].body_count > 0; }
+
+static bool is_body(uintptr_t obj)
+{
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return true;
+    return false;
+}
+
+// 局内监管本体的场景对象(跳过巡视者)。准备阶段没有 [1] 单位，返回 false
+static bool hunter_body(uint64_t &obj)
+{
+    if (!g_available) return false;
+    uint64_t v = g_buf[g_active].hunter_body;
+    if (v == 0) return false;
+    obj = v;
+    return true;
+}
+
+// ---- 模仿者模式 ----
+// 当前是不是模仿者对局(1088 里读到了活人)
+static inline bool copycat_active() { return g_available && g_buf[g_active].copycat_count > 0; }
+
+// 界面开关「模仿者模式」每帧同步过来：开着才记身份簿，关掉就清空
+static inline void set_copycat_book(bool on) { g_book_enabled = on; }
+
+// 身份簿当前内容(拷贝一份给界面用，16 格很小)
+static inline CopycatBook copycat_book() { return g_book[g_book_active]; }
+
+// 簿子里有没有东西 —— 有就说明是模仿者局，绘制侧改用簿子过滤(开会时本体集合读不全)
+static bool copycat_book_ready()
+{
+    const CopycatBook &b = g_book[g_book_active];
+    for (int i = 0; i < MAX_COPYCAT; i++) if (b.seat[i].known && b.seat[i].body) return true;
+    return false;
+}
+
+// 场景对象 -> 身份号(identity_id) 和 游戏里的号码。查身份簿，所以读不到的轮次沿用上次的值。
+// 不是簿子里的活人(包括死者、假面舞会的石像等不认识的模型)返回 false
+static bool copycat_identity(uintptr_t obj, int &identity, int &seat)
+{
+    const CopycatBook &b = g_book[g_book_active];
+    for (int i = 0; i < MAX_COPYCAT; i++) {
+        const CopycatSeat &s = b.seat[i];
+        if (!s.known || s.dead || s.body != (uint64_t)obj) continue;
+        identity = s.identity;
+        seat = i + 1;
+        return true;
+    }
+    return false;
+}
+
+// 某个号码的人当前的 unit.position(x / 高度 / y)。没校准、没读到、超过 POS_HOLD_MS 没更新都返回 false，
+// 绘制侧这时退回按场景对象画
+static bool copycat_seat_pos(int seat, float &x, float &z, float &y)
+{
+    if (seat < 1 || seat > MAX_COPYCAT) return false;
+    const CopycatPos &p = g_pos[g_pos_active][seat - 1];
+    if (!p.ok) return false;
+    x = p.x; z = p.z; y = p.y;
+    return true;
+}
+
+// 阵营按号段：1xx 侦探团 / 2xx 模仿者 / 3xx 中立(没有独立的阵营字段，若辰那些 camp* 属性在这个模式下全不存在)
+static inline int copycat_camp(int identity) { return identity / 100; }
+
+// 身份名：若辰 sub_394ED4 的跳转表(本人两局 114/301 已实测对上)。
+// 101 = 侦探：若辰先把名字预设成"侦探"再按 identity-101 查表，只有 101 那格直接跳到汇合点、不改名字(2026-09-26 解表确认)
+static const char *copycat_identity_name(int identity)
+{
+    static const char *const good[] = { "侦探", "哨兵", "治安官", "猎人", "香料师", "锁匠", "银行家", "修士", "演说家",
+                                        "拳击手", "灵媒", "学徒", "密探", "掮客", "药剂师", "巡林员", "执灯人", "评论家" };
+    static const char *const bad[] = { "神偷", "千面人", "阴谋家", "烟火师", "怪盗", "催眠师", "地下医生", "处刑人", "指挥家" };
+    static const char *const neutral[] = { "流浪汉", "送货员", "愚人", "棋手", "清洁工", "顾问", "降灵师", "导演" };
+    int k = identity % 100 - 1;
+    switch (identity / 100) {
+        case 1: if (k >= 0 && k < (int)(sizeof(good) / sizeof(good[0]))) return good[k]; break;
+        case 2: if (k >= 0 && k < (int)(sizeof(bad) / sizeof(bad[0]))) return bad[k]; break;
+        case 3: if (k >= 0 && k < (int)(sizeof(neutral) / sizeof(neutral[0]))) return neutral[k]; break;
+    }
+    return nullptr;
+}
+
+} // namespace PySelf
+
+#endif // IDV_PY_SELF_H
