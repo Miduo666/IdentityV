@@ -10,6 +10,7 @@
 #include "PyProgress.h"
 #include "PyGenius.h"
 #include "PySelf.h"
+#include "AutoPallet.h"
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
@@ -526,6 +527,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     PyGenius::start(libbase);
     // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
     PySelf::start(libbase);
+    // 自动盖板：独立线程 10ms 一轮，板子列表由下面的读取循环每轮发布过去
+    AutoPallet::start();
 
     Arrayaddr = getPtr64(libbase + ArrayaddrOffset);
     uint64_t ArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
@@ -563,6 +566,9 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         uintptr_t rq_local = 0, rq_mirror_local = 0, mirror_local = 0, mirror_preview_local = 0;
         char prophet_local[sizeof(prophet_text)];
         prophet_local[0] = 0;
+        // 自动盖板用的板子(类名含 woodplane)。getscene() 不认板子、它们进不了 data[]，所以单独收
+        uint64_t boards_local[AutoPallet::MAX_BOARDS];
+        int boards_n = 0;
         for (int ii = 0; ii < Count && entity_count < 1000; ii++){
             cur_obj = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
                 
@@ -600,7 +606,13 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	        if (g_name_cache.size() > 1500) g_name_cache.clear();
     	        g_name_cache[cur_obj] = std::make_pair(chain_head, filter_class_name);
     	    }
-        		
+
+    	    if (boards_n < AutoPallet::MAX_BOARDS && filter_class_name.find("woodplane") != std::string::npos) {
+    	        bool seen = false;
+    	        for (int k = 0; k < boards_n; k++) if (boards_local[k] == cur_obj) { seen = true; break; }
+    	        if (!seen) boards_local[boards_n++] = cur_obj;
+    	    }
+
 			int is_dup=0;
 			float pd1 = getFloat(cur_obj + 0x1a0);   // 原来还读一次 +0x298(pd2)，没人用，已删
 			for (int i = 0; i < entity_count; i++){
@@ -730,6 +742,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         mirror_obj          = mirror_local;
         mirror_preview_obj  = mirror_preview_local;
         if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
+        AutoPallet::publish_boards(boards_local, boards_n);
         data_count = entity_count;
         // 2026-09-23：3 秒 -> 2 秒。一轮实测约 9ms，读线程 CPU 0.3% -> 0.45%，
         // data[] 的撕裂窗口同比例从 0.3% 到 0.45%，都可忽略；换来新对象和预知监管更快出现
@@ -977,8 +990,50 @@ void Draw_Main(ImDrawList *Draw){
         }
     }
 
+    // 自动盖板的触摸点：对准游戏里的交互(放板)按钮
+    if (AutoPallet::show_touch_point) {
+        ImVec2 tp(AutoPallet::touch_x, AutoPallet::touch_y);
+        Draw->AddCircle(tp, 40.0f, ImColor(0, 255, 255, 255), 32, 3.0f);
+        Draw->AddLine({tp.x - 12, tp.y}, {tp.x + 12, tp.y}, ImColor(0, 255, 255, 255), 2.0f);
+        Draw->AddLine({tp.x, tp.y - 12}, {tp.x, tp.y + 12}, ImColor(0, 255, 255, 255), 2.0f);
+        Draw->AddText({tp.x + 46, tp.y - 12}, ImColor(0, 255, 255, 255), "盖板触摸点");
+    }
+
     // 以上是屏幕坐标的 HUD(预知/花名册/最后一台)，不依赖矩阵；以下全部要投影
     if (!matrix_usable) return;
+
+    // ---- 自动盖板判定范围：附近立着的板子，按若辰的矩形(或小丑拉锯时的圆)画在地上，命中的那块标红 ----
+    if (AutoPallet::show_range) {
+        AutoPallet::RangeRect rects[AutoPallet::MAX_RECTS];
+        int nr = AutoPallet::ranges(rects, AutoPallet::MAX_RECTS);
+        auto project = [&](float x, float y, float h, ImVec2 &out) -> bool {
+            float cam = matrix[3]*x + matrix[7]*h + matrix[11]*y + matrix[15];
+            if (cam <= 0.01f) return false;
+            out.x = px + (matrix[0]*x + matrix[4]*h + matrix[8]*y + matrix[12]) / cam * px;
+            out.y = py - (matrix[1]*x + matrix[5]*h + matrix[9]*y + matrix[13]) / cam * py;
+            return true;
+        };
+        for (int i = 0; i < nr; i++) {
+            const AutoPallet::RangeRect &r = rects[i];
+            ImColor col = r.candidate ? ImColor(255, 60, 60, 255) : ImColor(255, 220, 0, 220);
+            if (r.r > 0) {                                   // 圆形判定：画 24 边形
+                ImVec2 pts[24]; bool ok = true;
+                for (int k = 0; k < 24 && ok; k++) {
+                    float ang = k * 6.2831853f / 24;
+                    ok = project(r.cx + r.r * cosf(ang), r.cy + r.r * sinf(ang), r.cz, pts[k]);
+                }
+                if (ok) Draw->AddPolyline(pts, 24, col, ImDrawFlags_Closed, 2.5f);
+                continue;
+            }
+            float vx = -r.uy, vy = r.ux;                     // 垂直方向
+            float cx[4] = { r.a,  r.a, -r.a, -r.a};
+            float cy[4] = { r.b, -r.b, -r.b,  r.b};
+            ImVec2 pts[4]; bool ok = true;
+            for (int k = 0; k < 4 && ok; k++)
+                ok = project(r.cx + cx[k] * r.ux + cy[k] * vx, r.cy + cx[k] * r.uy + cy[k] * vy, r.cz, pts[k]);
+            if (ok) Draw->AddPolyline(pts, 4, col, ImDrawFlags_Closed, 2.5f);
+        }
+    }
 
     // ---- 大门开门进度 ----
     // 大门**不走下面那个实体循环**：getscene() 只认 prop_76/sender，大门那条分支收不到东西
@@ -1693,6 +1748,27 @@ void Layout_tick_UI(bool *main_thread_flag) {
                     ImGui::TextColored(c.Value, "%s", row);
                 }
             }
+        }
+
+        // 自动盖板(若辰同款判定)：监管走进板子判定区、自己站在板边、两人相距 ≤3 米时点一下交互键
+        if (ImGui::CollapsingHeader("自动盖板")) {
+            ImGui::Checkbox("自动盖板", &AutoPallet::enabled);
+            ImGui::SameLine();
+            ImGui::Checkbox("显示判定范围", &AutoPallet::show_range);
+            ImGui::Checkbox("显示触摸点", &AutoPallet::show_touch_point);
+            ImGui::SameLine();
+            if (ImGui::Button("测试点击")) AutoPallet::request_test_tap();
+
+            static const char *modes[] = {"暴力(宽12)", "演戏(宽8)", "随机(8~12)"};
+            ImGui::Combo("模式", &AutoPallet::mode, modes, 3);
+            ImGui::DragFloat("触摸点 X", &AutoPallet::touch_x, 2.0f, 0.0f, (float)displayInfo.width, "%.0f");
+            ImGui::DragFloat("触摸点 Y", &AutoPallet::touch_y, 2.0f, 0.0f, (float)displayInfo.height, "%.0f");
+            ImGui::SliderInt("按住(ms)", &AutoPallet::hold_ms, 10, 120);
+
+            ImGui::Text("状态: %s", AutoPallet::status_text());
+            ImGui::Text("点击 成功%d 失败%d  确认放下%d", AutoPallet::g_tap_ok.load(), AutoPallet::g_tap_fail.load(),
+                        AutoPallet::g_confirmed.load());
+            ImGui::Text("上次: %s", AutoPallet::last_result());
         }
 
         // 发布版本: 注入功能已停用

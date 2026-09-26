@@ -7,6 +7,7 @@
 #include <vector>
 #include <thread>
 #include <unordered_map>
+#include <mutex>
 #include "spinlock.h"
 
 #include "imgui.h"
@@ -529,6 +530,137 @@ namespace Touch {
             }
         }
         return {x, y};
+    }
+
+    // Touch2Screen 的逆运算：屏幕像素(当前方向) -> 触摸屏原生坐标。四个方向逐项对照上面反推，
+    // 用同一组 orientation/screenSize/touch_scale，保证菜单点得准的设备上注入也点得准
+    Vector2 Screen2Touch(const Vector2 &s) {
+        const float L = screenSize.x, S = screenSize.y;   // screenSize 在 Init 里固定成 (长边, 短边)
+        float xt, yt;
+        if (otherTouch) {
+            switch (orientation) {
+                case 1:  xt = s.x;     yt = s.y;     break;
+                case 2:  xt = S - s.x; yt = s.y;     break;
+                case 3:  xt = S - s.x; yt = L - s.y; break;
+                default: xt = s.y;     yt = S - s.x; break;
+            }
+        } else {
+            switch (orientation) {
+                case 1:  xt = S - s.y; yt = s.x;     break;
+                case 2:  xt = S - s.x; yt = L - s.y; break;
+                case 3:  xt = s.y;     yt = L - s.x; break;
+                default: xt = s.x;     yt = s.y;     break;
+            }
+        }
+        return {xt * touch_scale.x, yt * touch_scale.y};
+    }
+
+    // ---- 注入一次点击(自动盖板用) ----
+    // 学若辰(sub_4241C8)：不 EVIOCGRAB、不建 uinput 虚拟设备，直接往真实触摸屏写一个**空闲的 MT slot**。
+    // 玩家的手指各占各的 slot，注入的手指用另一个，摇杆不会断。没有空闲 slot 就放弃，不抢。
+    // slot 切换由内核 input core 统一记账(ABS_MT_SLOT 先暂存、有数据时才下发)，驱动下一帧会自己切回它的 slot，
+    // 所以写完不用恢复。代价：驱动若开了 INPUT_MT_DROP_UNUSED，玩家手指在动时驱动下一帧会把我们这个 slot 抬起，
+    // 按住时间被截短成一帧(约 8ms)——点击照样成立(按下+抬起都在按钮上)。
+    static std::mutex inject_mutex;
+    static int inject_slots = 0;             // 0 = 还没探测
+    static int inject_trk_max = 65535;
+    static bool inject_has_btn_touch = false, inject_has_major = false, inject_has_pressure = false;
+    static int inject_pressure = 0;
+    static int inject_trk_seq = 0;
+
+    static bool probe_inject_caps(int fd) {
+        input_absinfo a{};
+        if (ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &a) != 0 || a.maximum < 1) return false;
+        inject_slots = a.maximum + 1;
+        if (inject_slots > 32) inject_slots = 32;
+        if (ioctl(fd, EVIOCGABS(ABS_MT_TRACKING_ID), &a) == 0 && a.maximum > 16) inject_trk_max = a.maximum;
+        uint8_t keybits[KEY_MAX / 8 + 1]{};
+        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0)
+            inject_has_btn_touch = keybits[BTN_TOUCH / 8] & (1 << (BTN_TOUCH % 8));
+        uint8_t absbits[ABS_MAX / 8 + 1]{};
+        if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0) {
+            inject_has_major = absbits[ABS_MT_TOUCH_MAJOR / 8] & (1 << (ABS_MT_TOUCH_MAJOR % 8));
+            inject_has_pressure = absbits[ABS_MT_PRESSURE / 8] & (1 << (ABS_MT_PRESSURE % 8));
+            if (inject_has_pressure && ioctl(fd, EVIOCGABS(ABS_MT_PRESSURE), &a) == 0)
+                inject_pressure = a.maximum > 1 ? a.maximum / 2 : 1;
+        }
+        return true;
+    }
+
+    // 读每个 slot 当前的 tracking id(-1 = 空闲)。n = 实际读到的个数
+    static bool read_slot_ids(int fd, int *ids, int n) {
+        struct { __u32 code; __s32 values[32]; } req{};
+        req.code = ABS_MT_TRACKING_ID;
+        if (ioctl(fd, EVIOCGMTSLOTS(sizeof(__u32) + sizeof(__s32) * n), &req) < 0) return false;
+        for (int i = 0; i < n; i++) ids[i] = req.values[i];
+        return true;
+    }
+
+    static void put_ev(input_event *ev, int &k, int type, int code, int value) {
+        ev[k].type = type; ev[k].code = code; ev[k].value = value; k++;
+    }
+
+    const char *InjectResultText(int r) {
+        switch (r) {
+            case INJECT_OK:          return "completed";
+            case INJECT_NOT_READY:   return "not_ready";
+            case INJECT_NO_SLOT:     return "no_free_slot";
+            case INJECT_BAD_POS:     return "invalid_position";
+            case INJECT_DOWN_FAILED: return "down_write_failed";
+            case INJECT_UP_FAILED:   return "up_write_failed";
+            default:                 return "unknown";
+        }
+    }
+
+    int InjectTap(float sx, float sy, int hold_ms) {
+        std::lock_guard<std::mutex> g(inject_mutex);
+        if (!initialized || devices.empty() || devices[0].fd <= 0) return INJECT_NOT_READY;
+        const int fd = devices[0].fd;
+        if (inject_slots == 0 && !probe_inject_caps(fd)) return INJECT_NOT_READY;
+
+        Vector2 p = Screen2Touch({sx, sy});
+        const input_absinfo &ax = devices[0].absX, &ay = devices[0].absY;
+        if (!(p.x >= ax.minimum && p.x <= ax.maximum && p.y >= ay.minimum && p.y <= ay.maximum))
+            return INJECT_BAD_POS;
+
+        int ids[32];
+        if (!read_slot_ids(fd, ids, inject_slots)) return INJECT_NOT_READY;
+        int slot = -1, others = 0;
+        for (int i = inject_slots - 1; i >= 0; i--) {            // 若辰也是从最高的 slot 往下找
+            if (ids[i] < 0) { if (slot < 0) slot = i; }
+            else others++;
+        }
+        if (slot < 0) return INJECT_NO_SLOT;
+
+        // tracking id 取在范围顶部附近，避开驱动从小往上分配的那段
+        int trk = inject_trk_max - 1 - (inject_trk_seq++ & 7);
+        input_event ev[16]{};
+        int k = 0;
+        put_ev(ev, k, EV_ABS, ABS_MT_SLOT, slot);
+        put_ev(ev, k, EV_ABS, ABS_MT_TRACKING_ID, trk);
+        put_ev(ev, k, EV_ABS, ABS_MT_POSITION_X, (int) p.x);
+        put_ev(ev, k, EV_ABS, ABS_MT_POSITION_Y, (int) p.y);
+        if (inject_has_major) put_ev(ev, k, EV_ABS, ABS_MT_TOUCH_MAJOR, 6);
+        if (inject_has_pressure) put_ev(ev, k, EV_ABS, ABS_MT_PRESSURE, inject_pressure);
+        if (inject_has_btn_touch && others == 0) put_ev(ev, k, EV_KEY, BTN_TOUCH, 1);
+        put_ev(ev, k, EV_SYN, SYN_REPORT, 0);
+        if (write(fd, ev, sizeof(input_event) * k) != (ssize_t) (sizeof(input_event) * k))
+            return INJECT_DOWN_FAILED;
+
+        if (hold_ms > 0) usleep(hold_ms * 1000);
+
+        // 抬起前重新看一眼：按住期间玩家可能松开了所有手指，那时 BTN_TOUCH 要跟着归零
+        others = 0;
+        if (read_slot_ids(fd, ids, inject_slots))
+            for (int i = 0; i < inject_slots; i++) if (i != slot && ids[i] >= 0) others++;
+        k = 0;
+        put_ev(ev, k, EV_ABS, ABS_MT_SLOT, slot);
+        put_ev(ev, k, EV_ABS, ABS_MT_TRACKING_ID, -1);
+        if (inject_has_btn_touch && others == 0) put_ev(ev, k, EV_KEY, BTN_TOUCH, 0);
+        put_ev(ev, k, EV_SYN, SYN_REPORT, 0);
+        if (write(fd, ev, sizeof(input_event) * k) != (ssize_t) (sizeof(input_event) * k))
+            return INJECT_UP_FAILED;
+        return INJECT_OK;
     }
 
     Vector2 GetScale() {
